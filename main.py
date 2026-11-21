@@ -1,14 +1,16 @@
+import io
 import os
 
 # Disable GPU probing before importing MediaPipe (prevents EGL errors on headless servers)
 os.environ["MEDIAPIPE_DISABLE_GPU"] = "1"
 
 import urllib.request
-import cv2
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import numpy as np
+from PIL import Image
+from scipy.ndimage import binary_closing, binary_opening
 import streamlit as st
 
 from style_and_size_app import (
@@ -100,24 +102,35 @@ def load_pose_detector():
 
 
 def decode_uploaded_file(uploaded_file) -> np.ndarray:
-    """Decode a Streamlit UploadedFile or camera_input directly in RAM."""
-    raw_bytes = uploaded_file.getvalue()
-    np_arr = np.frombuffer(raw_bytes, np.uint8)
-    image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-    if image is None:
-        raise ValueError("Could not decode image. Please try another photo.")
-    return image
+    """Decode a Streamlit UploadedFile or camera_input directly in RAM into a BGR array."""
+    try:
+        pil_img = Image.open(io.BytesIO(uploaded_file.getvalue())).convert("RGB")
+    except Exception as exc:
+        raise ValueError("Could not decode image. Please try another photo.") from exc
+
+    rgb = np.asarray(pil_img, dtype=np.uint8)
+    # Convert RGB -> BGR so downstream OpenCV functions in style_and_size_app.py receive BGR
+    return rgb[:, :, ::-1].copy()
+
+
+def _resize_array_pil(arr: np.ndarray, new_w: int, new_h: int, is_mask: bool = False) -> np.ndarray:
+    """Resize a 2D or 3D NumPy array using Pillow."""
+    mode = "F" if (is_mask and arr.dtype != np.uint8) else ("L" if arr.ndim == 2 else "RGB")
+    pil_img = Image.fromarray(arr, mode=mode)
+    resample = Image.Resampling.BILINEAR if is_mask else Image.Resampling.LANCZOS
+    resized = pil_img.resize((new_w, new_h), resample=resample)
+    return np.asarray(resized)
 
 
 def process_bgr_image(image: np.ndarray, detector):
-    """Resize image, run PoseLandmarker, and return image, landmarks, and binary mask."""
+    """Resize image, run PoseLandmarker, and return BGR image, landmarks, and binary mask."""
     h, w = image.shape[:2]
     scale = 1024 / max(h, w)
-    new_w, new_h = int(w * scale), int(h * scale)
-    interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
-    image = cv2.resize(image, (new_w, new_h), interpolation=interp)
+    new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
 
-    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    bgr_resized = _resize_array_pil(image[:, :, ::-1], new_w, new_h, is_mask=False)[:, :, ::-1].copy()
+    rgb = bgr_resized[:, :, ::-1].copy()
+
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
     results = detector.detect(mp_image)
 
@@ -127,14 +140,16 @@ def process_bgr_image(image: np.ndarray, detector):
         )
 
     landmarks = results.pose_landmarks[0]
-    raw_mask = np.squeeze(results.segmentation_masks[0].numpy_view())
-    mask = (cv2.resize(raw_mask, (new_w, new_h)) > 0.5).astype(np.uint8)
+    raw_mask = np.squeeze(results.segmentation_masks[0].numpy_view()).astype(np.float32)
+    resized_mask = _resize_array_pil(raw_mask, new_w, new_h, is_mask=True)
+    bool_mask = resized_mask > 0.5
 
-    kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    struct = np.ones((5, 5), dtype=bool)
+    bool_mask = binary_closing(bool_mask, structure=struct)
+    bool_mask = binary_opening(bool_mask, structure=struct)
+    mask = bool_mask.astype(np.uint8)
 
-    return image, landmarks, mask, new_h, new_w
+    return bgr_resized, landmarks, mask, new_h, new_w
 
 
 def render_color_swatches(colors):
