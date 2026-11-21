@@ -1,4 +1,5 @@
 import os
+import urllib.request
 import cv2
 import mediapipe as mp
 from mediapipe.tasks import python
@@ -19,6 +20,10 @@ from style_and_size_app import (
 )
 
 MODEL_PATH = "pose_landmarker_heavy.task"
+MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+    "pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task"
+)
 
 COLOR_HEX_MAP = {
     "Coral": "#FF7F50",
@@ -70,11 +75,12 @@ st.set_page_config(
 
 @st.cache_resource
 def load_pose_detector():
-    """Load MediaPipe PoseLandmarker once and cache it across reruns."""
+    """Download the MediaPipe model if missing, then load and cache it."""
     if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(
-            f"Model file '{MODEL_PATH}' not found. Download it into your project folder first."
-        )
+        tmp_path = f"{MODEL_PATH}.tmp"
+        with st.spinner("Downloading MediaPipe Pose model (~30 MB)..."):
+            urllib.request.urlretrieve(MODEL_URL, tmp_path)
+            os.replace(tmp_path, MODEL_PATH)
 
     options = vision.PoseLandmarkerOptions(
         base_options=python.BaseOptions(model_asset_path=MODEL_PATH),
@@ -206,11 +212,11 @@ st.write(
     "and seasonal color palette."
 )
 
-# Load model once at startup
+# Load model once at startup (auto-downloads if missing)
 try:
     detector = load_pose_detector()
 except Exception as e:
-    st.error(str(e))
+    st.error(f"Failed to load MediaPipe model: {e}")
     st.stop()
 
 # Sidebar: User details & capture mode
