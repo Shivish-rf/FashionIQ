@@ -17,10 +17,14 @@ LM = {
     "mouth_right": 10,
     "left_shoulder": 11,
     "right_shoulder": 12,
+    "left_wrist": 15,
+    "right_wrist": 16,
     "left_hip": 23,
     "right_hip": 24,
     "left_knee": 25,
     "right_knee": 26,
+    "left_ankle": 27,
+    "right_ankle": 28,
 }
 
 
@@ -132,7 +136,100 @@ def ellipse_circumference(width_cm, depth_cm):
 
 
 # =========================================
-# 2. CIELAB SKIN-TONE & COLOR ANALYSIS
+# 2. POSE VALIDATION & WEIGHT CALIBRATION
+# =========================================
+
+def validate_pose_and_angle(landmarks, view="front"):
+    """
+    Validate that the photo shows the full body and matches the requested angle.
+    Returns (is_valid: bool, warnings: list[str]).
+    """
+    warnings = []
+
+    nose = landmarks[LM["nose"]]
+    l_ankle, r_ankle = landmarks[LM["left_ankle"]], landmarks[LM["right_ankle"]]
+    l_sh, r_sh = landmarks[LM["left_shoulder"]], landmarks[LM["right_shoulder"]]
+    l_hip, r_hip = landmarks[LM["left_hip"]], landmarks[LM["right_hip"]]
+
+    if nose.visibility < 0.5:
+        warnings.append("Head/face is not clearly visible. Step back slightly.")
+    if max(l_ankle.visibility, r_ankle.visibility) < 0.5:
+        warnings.append("Feet/ankles are cut off. Step back ~2 meters so your full body fits.")
+
+    shoulder_dx = abs(l_sh.x - r_sh.x)
+    torso_dy = max(abs(((l_hip.y + r_hip.y) / 2) - ((l_sh.y + r_sh.y) / 2)), 0.01)
+    shoulder_ratio = shoulder_dx / torso_dy
+
+    if view == "front" and shoulder_ratio < 0.35:
+        warnings.append("You appear turned sideways. Face straight toward the camera for the Front photo.")
+    elif view == "side" and shoulder_ratio > 0.32:
+        warnings.append("You are not fully sideways. Turn a full 90 degrees for the Side photo.")
+
+    return (len(warnings) == 0), warnings
+
+
+def apply_weight_calibration(measurements, height_cm, weight_kg, gender="male"):
+    """
+    Use height + weight to detect baggy clothes or camera distortion,
+    and blend silhouette measurements with anthropometric expectations.
+    """
+    height_m = height_cm / 100.0
+    bmi = weight_kg / (height_m ** 2)
+
+    if gender.lower() == "female":
+        expected_waist = 0.38 * height_cm + 1.65 * (bmi - 22.0)
+        expected_chest = 0.50 * height_cm + 1.50 * (bmi - 22.0)
+        expected_hip = 0.53 * height_cm + 1.60 * (bmi - 22.0)
+    else:
+        expected_waist = 0.45 * height_cm + 1.95 * (bmi - 22.0)
+        expected_chest = 0.55 * height_cm + 1.65 * (bmi - 22.0)
+        expected_hip = 0.54 * height_cm + 1.45 * (bmi - 22.0)
+
+    priors = {
+        "chest": expected_chest,
+        "waist": expected_waist,
+        "hip": expected_hip,
+    }
+
+    raw_waist = measurements["waist"]["circumference_cm"]
+    waist_diff = raw_waist - expected_waist
+
+    alerts = []
+    alpha = 0.80
+
+    if waist_diff > 10.0:
+        alerts.append(
+            f"Baggy clothing detected: silhouette waist ({raw_waist} cm) is much larger than "
+            f"expected for {weight_kg} kg. Measurements were adjusted using your weight."
+        )
+        alpha = 0.60
+    elif waist_diff < -10.0:
+        alerts.append(
+            "Possible camera tilt or distance distortion: silhouette looks smaller than expected "
+            "for your height & weight. Retake with the camera straight at waist height."
+        )
+        alpha = 0.65
+
+    calibrated = {}
+    for part, data in measurements.items():
+        raw_c = data["circumference_cm"]
+        if part in priors:
+            adj_c = alpha * raw_c + (1.0 - alpha) * priors[part]
+        else:
+            adj_c = raw_c
+
+        calibrated[part] = {
+            **data,
+            "raw_circumference_cm": raw_c,
+            "circumference_cm": round(adj_c, 1),
+            "circumference_in": round(adj_c / 2.54, 1),
+        }
+
+    return calibrated, alerts
+
+
+# =========================================
+# 3. CIELAB SKIN-TONE & COLOR ANALYSIS
 # =========================================
 
 def gray_world_white_balance(bgr_image):
@@ -163,18 +260,16 @@ def analyze_skin_tone(bgr_image, landmarks):
     l_ear = pt("left_ear")
     r_ear = pt("right_ear")
 
-    # Estimate face scale from eye-to-eye distance
     eye_dist = max(10, int(math.hypot(l_eye[0] - r_eye[0], l_eye[1] - r_eye[1])))
     patch_r = max(4, int(eye_dist * 0.22))
 
-    # Sample centers: left cheek, right cheek, and forehead
     eye_mid_x = (l_eye[0] + r_eye[0]) // 2
     eye_mid_y = (l_eye[1] + r_eye[1]) // 2
 
     sample_centers = [
-        ((nose[0] + l_ear[0]) // 2, (nose[1] + l_eye[1]) // 2),  # Left cheek
-        ((nose[0] + r_ear[0]) // 2, (nose[1] + r_eye[1]) // 2),  # Right cheek
-        (eye_mid_x, max(patch_r, eye_mid_y - int(eye_dist * 0.7))),  # Forehead
+        ((nose[0] + l_ear[0]) // 2, (nose[1] + l_eye[1]) // 2),
+        ((nose[0] + r_ear[0]) // 2, (nose[1] + r_eye[1]) // 2),
+        (eye_mid_x, max(patch_r, eye_mid_y - int(eye_dist * 0.7))),
     ]
 
     lab_pixels = []
@@ -192,12 +287,10 @@ def analyze_skin_tone(bgr_image, landmarks):
 
     all_pixels = np.vstack(lab_pixels).astype(np.float32)
 
-    # Convert OpenCV 8-bit LAB to true CIELAB ranges
     L_star = float(np.median(all_pixels[:, 0]) * (100.0 / 255.0))
     a_star = float(np.median(all_pixels[:, 1]) - 128.0)
     b_star = float(np.median(all_pixels[:, 2]) - 128.0)
 
-    # Depth classification
     if L_star >= 70:
         depth = "Fair / Light"
     elif L_star >= 55:
@@ -207,7 +300,6 @@ def analyze_skin_tone(bgr_image, landmarks):
     else:
         depth = "Deep / Rich"
 
-    # Undertone classification (b* = yellow/blue axis, a* = red/green axis)
     if b_star >= 15.0 and (b_star - a_star) >= 4.0:
         undertone = "Warm"
     elif b_star <= 10.0 or a_star > b_star:
@@ -215,7 +307,6 @@ def analyze_skin_tone(bgr_image, landmarks):
     else:
         undertone = "Neutral"
 
-    # Seasonal color palette mapping
     if undertone == "Warm" and L_star >= 55:
         season = "Spring (Warm & Light)"
         best_colors = ["Coral", "Warm Peach", "Turquoise", "Cream", "Camel", "Mint Green"]
@@ -248,7 +339,7 @@ def analyze_skin_tone(bgr_image, landmarks):
 
 
 # =========================================
-# 3. CLOTHING SIZE & BODY SHAPE ENGINE
+# 4. CLOTHING SIZE & BODY SHAPE ENGINE
 # =========================================
 
 def map_clothing_size(measurements, gender="male"):
@@ -341,7 +432,7 @@ def classify_body_shape(measurements, shoulder_width_cm):
 
 
 # =========================================
-# 4. MAIN PIPELINE
+# 5. STANDALONE CLI PIPELINE
 # =========================================
 
 def run_full_analysis(
@@ -370,11 +461,10 @@ def run_full_analysis(
     f_coords = get_measurement_coords(f_lm, f_h, f_w)
     s_coords = get_measurement_coords(s_lm, s_h, s_w)
 
-    # Shoulder width from front view
     sh_x, sh_y = f_coords["shoulder"]
     shoulder_width_cm = measure_segment_width_px(f_mask, sh_y, sh_x) * f_scale
 
-    measurements = {}
+    raw_measurements = {}
     for part in ["chest", "waist", "hip", "thigh"]:
         fx, fy = f_coords[part]
         sx, sy = s_coords[part]
@@ -382,12 +472,16 @@ def run_full_analysis(
         depth_cm = measure_segment_width_px(s_mask, sy, sx) * s_scale
         circ_cm = ellipse_circumference(width_cm, depth_cm)
 
-        measurements[part] = {
+        raw_measurements[part] = {
             "width_cm": round(width_cm, 1),
             "depth_cm": round(depth_cm, 1),
             "circumference_cm": round(circ_cm, 1),
             "circumference_in": round(circ_cm / 2.54, 1),
         }
+
+    measurements, alerts = apply_weight_calibration(
+        raw_measurements, user_height_cm, user_weight_kg, gender=gender
+    )
 
     bmi = round(user_weight_kg / ((user_height_cm / 100.0) ** 2), 1)
     color_profile = analyze_skin_tone(f_img, f_lm)
@@ -396,6 +490,7 @@ def run_full_analysis(
 
     return {
         "bmi": bmi,
+        "alerts": alerts,
         "measurements": measurements,
         "sizing": size_profile,
         "style": style_profile,
@@ -405,12 +500,17 @@ def run_full_analysis(
 
 if __name__ == "__main__":
     report = run_full_analysis(
-        front_path="front.png",
-        side_path="side.png",
+        front_path="front.jpg",
+        side_path="side.jpg",
         user_height_cm=175.0,
         user_weight_kg=72.0,
         gender="male",
     )
+
+    if report["alerts"]:
+        print("\n=== CALIBRATION ALERTS ===")
+        for alert in report["alerts"]:
+            print(f"  ! {alert}")
 
     print("\n=== BODY MEASUREMENTS ===")
     for part, d in report["measurements"].items():
@@ -419,8 +519,6 @@ if __name__ == "__main__":
     print("\n=== CLOTHING SIZE ===")
     print(f"  Top Size   : {report['sizing']['top_size']}")
     print(f"  Bottom Size: {report['sizing']['bottom_size']}")
-    for note in report["sizing"]["fit_notes"]:
-        print(f"  Note       : {note}")
 
     print("\n=== BODY SHAPE & STYLE ===")
     print(f"  Body Shape : {report['style']['body_shape']}")
@@ -429,6 +527,5 @@ if __name__ == "__main__":
 
     print("\n=== SKIN TONE & COLOR PALETTE ===")
     c = report["color_analysis"]
-    print(f"  Depth / Undertone: {c['depth']} | {c['undertone']} ({c['season']})")
-    print(f"  Best Colors      : {', '.join(c['best_colors'])}")
-    print(f"  Avoid Colors     : {', '.join(c['avoid_colors'])}")
+    print(f"  Season     : {c['season']}")
+    print(f"  Best Colors: {', '.join(c['best_colors'])}")

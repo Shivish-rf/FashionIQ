@@ -6,20 +6,20 @@ from mediapipe.tasks.python import vision
 import numpy as np
 import streamlit as st
 
-# Reuse your core functions from style_and_size_app.py
 from style_and_size_app import (
     analyze_skin_tone,
+    apply_weight_calibration,
     classify_body_shape,
     ellipse_circumference,
     get_cm_per_pixel,
     get_measurement_coords,
     map_clothing_size,
     measure_segment_width_px,
+    validate_pose_and_angle,
 )
 
 MODEL_PATH = "pose_landmarker_heavy.task"
 
-# Hex codes to render visual color swatches for the palette output
 COLOR_HEX_MAP = {
     "Coral": "#FF7F50",
     "Warm Peach": "#FFDAB9",
@@ -72,7 +72,9 @@ st.set_page_config(
 def load_pose_detector():
     """Load MediaPipe PoseLandmarker once and cache it across reruns."""
     if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(f"Model file not found: {MODEL_PATH}")
+        raise FileNotFoundError(
+            f"Model file '{MODEL_PATH}' not found. Download it into your project folder first."
+        )
 
     options = vision.PoseLandmarkerOptions(
         base_options=python.BaseOptions(model_asset_path=MODEL_PATH),
@@ -139,15 +141,77 @@ def render_color_swatches(colors):
     st.markdown(chips_html, unsafe_allow_html=True)
 
 
+def capture_guided_photo(view_name, input_mode, detector):
+    """
+    Guided camera/upload widget with instant pose & angle validation.
+    Returns (bgr_image, landmarks, mask, h, w) if captured, else None.
+    """
+    is_front = view_name == "front"
+    title = "1. Front View (A-Pose)" if is_front else "2. Side View (90° Profile)"
+    instructions = (
+        "Face straight ahead, stand ~2 meters back, and hold arms slightly away from your waist."
+        if is_front
+        else "Turn 90° sideways, stand straight, and keep arms relaxed at your sides."
+    )
+
+    st.subheader(title)
+    st.caption(instructions)
+
+    if input_mode == "Take Photos with Camera":
+        file_obj = st.camera_input(
+            f"Click {view_name.capitalize()} Photo",
+            key=f"{view_name}_cam",
+        )
+    else:
+        file_obj = st.file_uploader(
+            f"Upload {view_name.capitalize()} Photo",
+            type=["jpg", "jpeg", "png", "webp"],
+            key=f"{view_name}_up",
+        )
+        if file_obj:
+            st.image(
+                file_obj,
+                caption=f"{view_name.capitalize()} Preview",
+                use_container_width=True,
+            )
+
+    if not file_obj:
+        return None
+
+    try:
+        bgr = decode_uploaded_file(file_obj)
+        img, lm, mask, h, w = process_bgr_image(bgr, detector)
+        is_valid, warnings = validate_pose_and_angle(lm, view=view_name)
+
+        if is_valid:
+            st.success(f"{view_name.capitalize()} photo looks great!")
+        else:
+            for warn in warnings:
+                st.warning(warn)
+
+        return (img, lm, mask, h, w)
+    except Exception as e:
+        st.error(f"Photo check failed: {e}")
+        return None
+
+
 # =========================================
 # UI LAYOUT
 # =========================================
 
 st.title("👕 AI Virtual Sizing, Body Shape & Color Stylist")
 st.write(
-    "Provide a **Front** photo (A-pose) and a **Side** photo (90° profile) to estimate your "
-    "body measurements, clothing size, flattering styles, and seasonal color palette."
+    "Provide a **Front** photo (A-pose) and a **Side** photo (90° profile) along with your "
+    "height and weight to estimate your body measurements, clothing size, flattering styles, "
+    "and seasonal color palette."
 )
+
+# Load model once at startup
+try:
+    detector = load_pose_detector()
+except Exception as e:
+    st.error(str(e))
+    st.stop()
 
 # Sidebar: User details & capture mode
 with st.sidebar:
@@ -163,45 +227,28 @@ with st.sidebar:
         "**Tips for best accuracy:**\n"
         "- Wear fitted clothes\n"
         "- Stand ~2 meters away (head to feet visible)\n"
-        "- Front view: hold arms slightly away from waist (A-pose)"
+        "- Front view: hold arms slightly away from waist (A-pose)\n"
+        "- Side view: turn a full 90° sideways"
     )
 
-# Main input area: Front & Side photos
+# Main input area: Guided Front & Side photos
 col1, col2 = st.columns(2)
-
 with col1:
-    st.subheader("1. Front View (A-Pose)")
-    if input_mode == "Take Photos with Camera":
-        front_file = st.camera_input("Click Front Photo", key="front_cam")
-    else:
-        front_file = st.file_uploader("Upload Front Photo", type=["jpg", "jpeg", "png", "webp"], key="front_up")
-        if front_file:
-            st.image(front_file, caption="Front Preview", use_container_width=True)
-
+    front_data = capture_guided_photo("front", input_mode, detector)
 with col2:
-    st.subheader("2. Side View (90° Profile)")
-    if input_mode == "Take Photos with Camera":
-        side_file = st.camera_input("Click Side Photo", key="side_cam")
-    else:
-        side_file = st.file_uploader("Upload Side Photo", type=["jpg", "jpeg", "png", "webp"], key="side_up")
-        if side_file:
-            st.image(side_file, caption="Side Preview", use_container_width=True)
+    side_data = capture_guided_photo("side", input_mode, detector)
 
 st.divider()
 
 # Run Analysis Button
 if st.button("Analyze Size, Style & Colors", type="primary", use_container_width=True):
-    if not front_file or not side_file:
-        st.warning("Please provide both a Front photo and a Side photo before running the analysis.")
+    if not front_data or not side_data:
+        st.warning("Please capture or upload both a valid Front and Side photo first.")
     else:
-        with st.spinner("Analyzing pose, measurements, and skin tone..."):
+        with st.spinner("Calibrating measurements with your height & weight..."):
             try:
-                detector = load_pose_detector()
-                front_bgr = decode_uploaded_file(front_file)
-                side_bgr = decode_uploaded_file(side_file)
-
-                f_img, f_lm, f_mask, f_h, f_w = process_bgr_image(front_bgr, detector)
-                _, s_lm, s_mask, s_h, s_w = process_bgr_image(side_bgr, detector)
+                f_img, f_lm, f_mask, f_h, f_w = front_data
+                _, s_lm, s_mask, s_h, s_w = side_data
 
                 f_scale = get_cm_per_pixel(f_mask, height_cm)
                 s_scale = get_cm_per_pixel(s_mask, height_cm)
@@ -212,7 +259,7 @@ if st.button("Analyze Size, Style & Colors", type="primary", use_container_width
                 sh_x, sh_y = f_coords["shoulder"]
                 shoulder_width_cm = measure_segment_width_px(f_mask, sh_y, sh_x) * f_scale
 
-                measurements = {}
+                raw_measurements = {}
                 for part in ["chest", "waist", "hip", "thigh"]:
                     fx, fy = f_coords[part]
                     sx, sy = s_coords[part]
@@ -220,12 +267,17 @@ if st.button("Analyze Size, Style & Colors", type="primary", use_container_width
                     depth_cm = measure_segment_width_px(s_mask, sy, sx) * s_scale
                     circ_cm = ellipse_circumference(width_cm, depth_cm)
 
-                    measurements[part] = {
+                    raw_measurements[part] = {
                         "width_cm": round(width_cm, 1),
                         "depth_cm": round(depth_cm, 1),
                         "circumference_cm": round(circ_cm, 1),
                         "circumference_in": round(circ_cm / 2.54, 1),
                     }
+
+                # Apply height + weight calibration & baggy-clothing sanity check
+                measurements, calibration_alerts = apply_weight_calibration(
+                    raw_measurements, height_cm, weight_kg, gender=gender
+                )
 
                 bmi = round(weight_kg / ((height_cm / 100.0) ** 2), 1)
                 color_profile = analyze_skin_tone(f_img, f_lm)
@@ -235,7 +287,11 @@ if st.button("Analyze Size, Style & Colors", type="primary", use_container_width
                 # =========================================
                 # DISPLAY RESULTS
                 # =========================================
-                st.success("Analysis Complete!")
+                if calibration_alerts:
+                    for alert in calibration_alerts:
+                        st.warning(alert)
+                else:
+                    st.success("Analysis complete — measurements verified against your height & weight!")
 
                 # 1. Top Summary Cards
                 m1, m2, m3, m4 = st.columns(4)
@@ -252,7 +308,7 @@ if st.button("Analyze Size, Style & Colors", type="primary", use_container_width
                 )
 
                 with tab_meas:
-                    st.subheader("Estimated Circumferences")
+                    st.subheader("Calibrated Circumferences")
                     mc1, mc2, mc3, mc4 = st.columns(4)
                     for col, part in zip([mc1, mc2, mc3, mc4], ["chest", "waist", "hip", "thigh"]):
                         d = measurements[part]
@@ -263,15 +319,16 @@ if st.button("Analyze Size, Style & Colors", type="primary", use_container_width
                             delta_color="off",
                         )
 
-                    with st.expander("View Raw Width & Depth Breakdown"):
+                    with st.expander("View Raw vs. Calibrated Breakdown"):
                         st.table(
                             [
                                 {
                                     "Body Part": p.capitalize(),
                                     "Front Width (cm)": d["width_cm"],
                                     "Side Depth (cm)": d["depth_cm"],
-                                    "Circumference (cm)": d["circumference_cm"],
-                                    "Circumference (in)": d["circumference_in"],
+                                    "Raw Circ (cm)": d.get("raw_circumference_cm", d["circumference_cm"]),
+                                    "Calibrated Circ (cm)": d["circumference_cm"],
+                                    "Calibrated Circ (in)": d["circumference_in"],
                                 }
                                 for p, d in measurements.items()
                             ]
