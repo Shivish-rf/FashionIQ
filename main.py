@@ -1,4 +1,8 @@
 import os
+
+# Disable GPU probing before importing MediaPipe (prevents EGL errors on headless servers)
+os.environ["MEDIAPIPE_DISABLE_GPU"] = "1"
+
 import urllib.request
 import cv2
 import mediapipe as mp
@@ -75,7 +79,7 @@ st.set_page_config(
 
 @st.cache_resource
 def load_pose_detector():
-    """Download the MediaPipe model if missing, then load and cache it."""
+    """Download the MediaPipe model if missing, then load and cache it on CPU."""
     if not os.path.exists(MODEL_PATH):
         tmp_path = f"{MODEL_PATH}.tmp"
         with st.spinner("Downloading MediaPipe Pose model (~30 MB)..."):
@@ -83,7 +87,10 @@ def load_pose_detector():
             os.replace(tmp_path, MODEL_PATH)
 
     options = vision.PoseLandmarkerOptions(
-        base_options=python.BaseOptions(model_asset_path=MODEL_PATH),
+        base_options=python.BaseOptions(
+            model_asset_path=MODEL_PATH,
+            delegate=python.BaseOptions.Delegate.CPU,
+        ),
         running_mode=vision.RunningMode.IMAGE,
         num_poses=1,
         min_pose_detection_confidence=0.5,
