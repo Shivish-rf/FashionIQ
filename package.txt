@@ -1,7 +1,2 @@
-libegl1
-libegl-mesa0
-libgles2
 libgl1
-libgbm1
 libglib2.0-0
-
